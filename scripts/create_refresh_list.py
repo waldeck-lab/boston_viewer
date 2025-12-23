@@ -35,6 +35,9 @@ CHILDREN_FILE = TMP_DIR / "children_to_Lepidoptera.json"
 SPECIES_IDS_FILE = TMP_DIR / "species_ids_lepidoptera.json"
 SPECIES_TABLE_FILE = TMP_DIR / "species_table_lepidoptera.json"
 
+# NEW: source revision file for fast no-op runs
+SOURCE_REV_FILE = TMP_DIR / "lepidoptera_source_rev.json"
+
 # Refresh-policy:
 # 0 = hämta endast taxa som saknas i cache (snabbast, "new only")
 # >0 = om cache är äldre än N sekunder, hämta om via POST /taxa
@@ -42,6 +45,9 @@ REFRESH_TTL_SECONDS = int(os.getenv("DYNTAXA_CACHE_TTL_SECONDS", "0"))
 
 HTTP_TIMEOUT = 30
 POST_BATCH_SIZE = int(os.getenv("DYNTAXA_POST_BATCH_SIZE", "200"))
+
+# If 1: return immediately when source rev unchanged
+FAST_EXIT_ON_UNCHANGED_SOURCE = os.getenv("DYNTAXA_FAST_EXIT", "1") == "1"
 
 
 # ========= Helpers =========
@@ -58,11 +64,37 @@ def _read_json(path: Path) -> Any:
 def _now() -> int:
     return int(time.time())
 
+def taxon_sha256(obj: dict) -> str:
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return _sha256_bytes(raw)
+
+def _stable_ids_hash(lepidoptera_id: int, child_ids: list[int]) -> str:
+    ids = sorted(int(x) for x in child_ids)
+    raw = json.dumps(
+        {"root": int(lepidoptera_id), "childIds": ids},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return _sha256_bytes(raw)
+
+def _load_source_rev() -> dict | None:
+    if not SOURCE_REV_FILE.exists():
+        return None
+    try:
+        return _read_json(SOURCE_REV_FILE)
+    except Exception:
+        return None
+
+def _write_source_rev(lepidoptera_id: int, child_ids: list[int], source_hash: str) -> None:
+    _dump_json(SOURCE_REV_FILE, {
+        "lepidopteraTaxonId": int(lepidoptera_id),
+        "childCount": len(child_ids),
+        "sourceHash": source_hash,
+        "updatedAt": _now(),
+    })
+
 def _http_get_json(url: str, *, params: dict | None = None, timeout: int = HTTP_TIMEOUT) -> tuple[int, dict | None, dict]:
-    """
-    Returnerar (status_code, json_obj_or_None, response_headers)
-    Vid 404 returnerar json=None.
-    """
     r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
 
     if r.status_code == 404:
@@ -80,11 +112,7 @@ def _http_get_json(url: str, *, params: dict | None = None, timeout: int = HTTP_
     return r.status_code, r.json(), dict(r.headers)
 
 def _http_post_json(url: str, *, params: dict | None = None, body: dict | None = None, timeout: int = HTTP_TIMEOUT) -> tuple[int, Any, dict]:
-    """
-    Returnerar (status_code, json_payload, response_headers)
-    """
     headers = dict(HEADERS)
-    # Matcha "Try me"
     headers["Content-Type"] = "application/json-patch+json"
 
     r = requests.post(url, headers=headers, params=params, json=body, timeout=timeout)
@@ -134,18 +162,7 @@ def find_taxon_id_lepidoptera() -> int:
         if it.get("name") == "Lepidoptera" and ti.get("recommendedScientificName") == "Lepidoptera":
             return int(ti["taxonId"])
 
-    brief = []
-    for it in items:
-        ti = it.get("taxonInformation", {}) or {}
-        brief.append({
-            "taxonId": ti.get("taxonId"),
-            "recommendedScientificName": ti.get("recommendedScientificName"),
-            "name": it.get("name"),
-            "category": (it.get("category", {}) or {}).get("value"),
-            "type": (it.get("type", {}) or {}).get("value"),
-            "status": (it.get("status", {}) or {}).get("value"),
-        })
-    raise RuntimeError("Kunde inte entydigt hitta Lepidoptera.\nTräffar:\n" + json.dumps(brief, ensure_ascii=False, indent=2))
+    raise RuntimeError("Kunde inte entydigt hitta Lepidoptera.")
 
 def fetch_children_ids(taxon_id: int, out_path: Path) -> dict:
     url = CHILDIDS_URL_TEMPLATE.format(taxon_id=taxon_id)
@@ -168,7 +185,6 @@ def _extract_child_ids(child_ids_payload: Any) -> list[int]:
 
 # ========= Cache =========
 def _cache_paths(taxon_id: int) -> tuple[Path, Path]:
-    # Sprid ut i subdir för att undvika för många filer i samma katalog
     sub = f"{taxon_id // 10000:04d}"
     data_path = CACHE_DIR / sub / f"{taxon_id}.json"
     meta_path = CACHE_DIR / sub / f"{taxon_id}.meta.json"
@@ -183,10 +199,6 @@ def _cache_needs_refresh(meta: dict) -> bool:
     return (_now() - fetched_at) >= REFRESH_TTL_SECONDS
 
 def get_taxon_cached(taxon_id: int) -> dict | None:
-    """
-    Returnerar taxon-objekt från cache om färskt.
-    Returnerar None om saknas (ej hämtad än / eller markerad missing).
-    """
     data_path, meta_path = _cache_paths(taxon_id)
     if data_path.exists() and meta_path.exists():
         meta = _read_json(meta_path)
@@ -205,8 +217,7 @@ def _write_cache(taxon_id: int, status: int, payload: dict | None) -> None:
     }
 
     if status == 200 and payload is not None:
-        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        meta["sha256"] = _sha256_bytes(raw)
+        meta["sha256"] = taxon_sha256(payload)
         _dump_json(data_path, payload)
     else:
         if data_path.exists():
@@ -215,9 +226,6 @@ def _write_cache(taxon_id: int, status: int, payload: dict | None) -> None:
     _dump_json(meta_path, meta)
 
 def _taxon_ids_to_fetch(all_ids: list[int]) -> list[int]:
-    """
-    Returnerar taxonIds som saknas i cache eller är stale enligt TTL.
-    """
     out: list[int] = []
     for tid in all_ids:
         data_path, meta_path = _cache_paths(tid)
@@ -238,10 +246,6 @@ def _chunk(seq: list[int], n: int):
         yield seq[i:i+n]
 
 def refresh_taxa_cache_batch(taxon_ids: list[int], *, culture: str = "sv_SE") -> int:
-    """
-    Hämtar (via POST) taxonobjekt för de ids som behöver.
-    Returnerar antal objekt skrivna som 200.
-    """
     to_fetch = _taxon_ids_to_fetch(taxon_ids)
     if not to_fetch:
         return 0
@@ -269,8 +273,6 @@ def refresh_taxa_cache_batch(taxon_ids: list[int], *, culture: str = "sv_SE") ->
             _write_cache(tid, 200, obj)
             written_ok += 1
 
-        # Om API:t inte returnerar vissa ids: markera som missing så vi inte loopar hårt på dem.
-        # (Det kan vara pseudotaxa/icke-taxonomiskt eller annat som inte returneras här.)
         for tid in batch:
             if tid not in returned_ids:
                 _write_cache(tid, 404, None)
@@ -322,7 +324,16 @@ def main() -> None:
     child_ids = _extract_child_ids(child_payload)
     print(f"Child ids count: {len(child_ids)}")
 
-    # Refresh cache in batches (only new or TTL-expired)
+    source_hash = _stable_ids_hash(lepidoptera_id, child_ids)
+    prev = _load_source_rev()
+    if prev and prev.get("sourceHash") == source_hash and int(prev.get("lepidopteraTaxonId", 0)) == int(lepidoptera_id):
+        print("Source revision unchanged (root + childIds).")
+        if FAST_EXIT_ON_UNCHANGED_SOURCE:
+            print("DYNTAXA_FAST_EXIT=1 => skipping refresh + rebuild + sqlite.")
+            return
+        else:
+            print("DYNTAXA_FAST_EXIT=0 => continuing anyway (TTL refresh may still happen).")
+
     before_missing = sum(1 for tid in child_ids if not _cache_paths(tid)[1].exists())
     written_ok = refresh_taxa_cache_batch(child_ids, culture="sv_SE")
 
@@ -349,48 +360,58 @@ def main() -> None:
     print(f"Wrote: {SPECIES_IDS_FILE}")
     print(f"Wrote: {SPECIES_TABLE_FILE}")
 
-
-
+    # SQLite integration
     DB_PATH = Path("./tmp/dyntaxa_lepidoptera.sqlite")
     con = db_open(DB_PATH)
 
-    run_id = begin_run(con, lepidoptera_id, len(child_ids))
-    
-    inserted = updated = 0
+    run_id = begin_run(con, lepidoptera_id, len(child_ids), source_hash=source_hash)
+
+    inserted = updated = unchanged = 0
     active_species: set[int] = set()
 
     for tid in child_ids:
         obj = get_taxon_cached(tid)
         if obj is None:
             continue
+        if not is_species_accepted_taxonomic(obj):
+            continue
 
-        if is_species_accepted_taxonomic(obj):
-            # hämta sha256 från din cache-meta om du vill
-            _data_path, meta_path = _cache_paths(tid)
-            sha = None
-            if meta_path.exists():
-                meta = _read_json(meta_path)
-                sha = meta.get("sha256")
+        _data_path, meta_path = _cache_paths(tid)
+        sha = None
+        if meta_path.exists():
+            meta = _read_json(meta_path)
+            sha = meta.get("sha256")
+        if sha is None:
+            sha = taxon_sha256(obj)
 
-            change = upsert_taxon(con, run_id, obj, sha, make_active=True)
-            if change == "inserted":
-                inserted += 1
-            elif change in ("updated", "reactivated"):
-                updated += 1
+        change = upsert_taxon(con, run_id, obj, sha, make_active=True)
+        if change == "inserted":
+            inserted += 1
+        elif change in ("updated", "reactivated"):
+            updated += 1
+        else:
+            unchanged += 1
 
-            active_species.add(tid)
+        active_species.add(tid)
 
     deactivated = deactivate_missing_species(con, run_id, active_species)
 
-    end_run(con, run_id,
-            species_count=len(active_species),
-            inserted=inserted,
-            updated=updated,
-            deactivated=deactivated)
+    end_run(
+        con,
+        run_id,
+        species_count=len(active_species),
+        inserted=inserted,
+        updated=updated,
+        unchanged=unchanged,
+        deactivated=deactivated,
+    )
 
-    print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, deactivated={deactivated}")
+    # Update revision file last (after successful run)
+    _write_source_rev(lepidoptera_id, child_ids, source_hash)
+
+    print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, unchanged={unchanged}, deactivated={deactivated}")
     print(f"DB: {DB_PATH}")
-
+    print(f"Source rev: {SOURCE_REV_FILE}")
 
 if __name__ == "__main__":
     main()
