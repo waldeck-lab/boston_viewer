@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from dyntaxa_sqlite import db_open, begin_run, end_run, upsert_taxon, deactivate_missing_species
+
 # ========= Config =========
 SUBSCRIPTION_KEY = os.getenv("ARTDB_KEY")
 if not SUBSCRIPTION_KEY:
@@ -346,6 +348,49 @@ def main() -> None:
     print(f"Skipped non-returned taxa (cached as 404/missing): {skipped_missing}")
     print(f"Wrote: {SPECIES_IDS_FILE}")
     print(f"Wrote: {SPECIES_TABLE_FILE}")
+
+
+
+    DB_PATH = Path("./tmp/dyntaxa_lepidoptera.sqlite")
+    con = db_open(DB_PATH)
+
+    run_id = begin_run(con, lepidoptera_id, len(child_ids))
+    
+    inserted = updated = 0
+    active_species: set[int] = set()
+
+    for tid in child_ids:
+        obj = get_taxon_cached(tid)
+        if obj is None:
+            continue
+
+        if is_species_accepted_taxonomic(obj):
+            # hämta sha256 från din cache-meta om du vill
+            _data_path, meta_path = _cache_paths(tid)
+            sha = None
+            if meta_path.exists():
+                meta = _read_json(meta_path)
+                sha = meta.get("sha256")
+
+            change = upsert_taxon(con, run_id, obj, sha, make_active=True)
+            if change == "inserted":
+                inserted += 1
+            elif change in ("updated", "reactivated"):
+                updated += 1
+
+            active_species.add(tid)
+
+    deactivated = deactivate_missing_species(con, run_id, active_species)
+
+    end_run(con, run_id,
+            species_count=len(active_species),
+            inserted=inserted,
+            updated=updated,
+            deactivated=deactivated)
+
+    print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, deactivated={deactivated}")
+    print(f"DB: {DB_PATH}")
+
 
 if __name__ == "__main__":
     main()
