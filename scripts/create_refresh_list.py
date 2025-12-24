@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import requests
 
 from dyntaxa_sqlite import db_open, begin_run, end_run, upsert_taxon, deactivate_missing_species
 
-# ========= Config =========
+# ========= Config (API key stays in env) =========
 SUBSCRIPTION_KEY = os.getenv("ARTDB_KEY")
 if not SUBSCRIPTION_KEY:
     print("Saknar ARTDB_KEY i environment. Kör: export ARTDB_KEY='...'", file=sys.stderr)
@@ -24,33 +25,19 @@ HEADERS = {
 
 NAMES_URL = "https://api.artdatabanken.se/taxonservice/v1/taxa/names"
 CHILDIDS_URL_TEMPLATE = "https://api.artdatabanken.se/taxonservice/v1/taxa/{taxon_id}/childids"
-
-# IMPORTANT: use POST /taxa for details (batch)
 TAXA_POST_URL = "https://api.artdatabanken.se/taxonservice/v1/taxa"
 
-TMP_DIR = Path("./tmp")
-CACHE_DIR = TMP_DIR / "taxa_cache"
+HTTP_TIMEOUT_DEFAULT = 30
 
-CHILDREN_FILE = TMP_DIR / "children_to_Lepidoptera.json"
-SPECIES_IDS_FILE = TMP_DIR / "species_ids_lepidoptera.json"
-SPECIES_TABLE_FILE = TMP_DIR / "species_table_lepidoptera.json"
-
-# NEW: source revision file for fast no-op runs
-SOURCE_REV_FILE = TMP_DIR / "lepidoptera_source_rev.json"
-
-# Refresh-policy:
-# 0 = hämta endast taxa som saknas i cache (snabbast, "new only")
-# >0 = om cache är äldre än N sekunder, hämta om via POST /taxa
-REFRESH_TTL_SECONDS = int(os.getenv("DYNTAXA_CACHE_TTL_SECONDS", "0"))
-
-HTTP_TIMEOUT = 30
-POST_BATCH_SIZE = int(os.getenv("DYNTAXA_POST_BATCH_SIZE", "200"))
-
-# If 1: return immediately when source rev unchanged
-FAST_EXIT_ON_UNCHANGED_SOURCE = os.getenv("DYNTAXA_FAST_EXIT", "1") == "1"
+REFRESH_TTL_SECONDS_DEFAULT = int(os.getenv("DYNTAXA_CACHE_TTL_SECONDS", "0"))
+POST_BATCH_SIZE_DEFAULT = int(os.getenv("DYNTAXA_POST_BATCH_SIZE", "200"))
+FAST_EXIT_ON_UNCHANGED_SOURCE_DEFAULT = os.getenv("DYNTAXA_FAST_EXIT", "1") == "1"
 
 
 # ========= Helpers =========
+def _now() -> int:
+    return int(time.time())
+
 def _sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -60,9 +47,6 @@ def _dump_json(path: Path, obj: Any) -> None:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
-
-def _now() -> int:
-    return int(time.time())
 
 def taxon_sha256(obj: dict) -> str:
     raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -78,23 +62,7 @@ def _stable_ids_hash(lepidoptera_id: int, child_ids: list[int]) -> str:
     ).encode("utf-8")
     return _sha256_bytes(raw)
 
-def _load_source_rev() -> dict | None:
-    if not SOURCE_REV_FILE.exists():
-        return None
-    try:
-        return _read_json(SOURCE_REV_FILE)
-    except Exception:
-        return None
-
-def _write_source_rev(lepidoptera_id: int, child_ids: list[int], source_hash: str) -> None:
-    _dump_json(SOURCE_REV_FILE, {
-        "lepidopteraTaxonId": int(lepidoptera_id),
-        "childCount": len(child_ids),
-        "sourceHash": source_hash,
-        "updatedAt": _now(),
-    })
-
-def _http_get_json(url: str, *, params: dict | None = None, timeout: int = HTTP_TIMEOUT) -> tuple[int, dict | None, dict]:
+def _http_get_json(url: str, *, params: dict | None = None, timeout: int) -> tuple[int, dict | None, dict]:
     r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
 
     if r.status_code == 404:
@@ -111,7 +79,7 @@ def _http_get_json(url: str, *, params: dict | None = None, timeout: int = HTTP_
 
     return r.status_code, r.json(), dict(r.headers)
 
-def _http_post_json(url: str, *, params: dict | None = None, body: dict | None = None, timeout: int = HTTP_TIMEOUT) -> tuple[int, Any, dict]:
+def _http_post_json(url: str, *, params: dict | None = None, body: dict | None = None, timeout: int) -> tuple[int, Any, dict]:
     headers = dict(HEADERS)
     headers["Content-Type"] = "application/json-patch+json"
 
@@ -128,19 +96,23 @@ def _http_post_json(url: str, *, params: dict | None = None, body: dict | None =
 
     return r.status_code, r.json(), dict(r.headers)
 
+def _chunk(seq: list[int], n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
 
 # ========= Dyntaxa-specific =========
-def find_taxon_id_lepidoptera() -> int:
+def find_taxon_id_lepidoptera(*, culture: str, timeout: int) -> int:
     params = {
         "searchString": "Lepidoptera",
         "searchFields": "Both",
         "isRecommended": "NotSet",
         "isOkForObservationSystems": "NotSet",
-        "culture": "sv_SE",
+        "culture": culture,
         "page": 1,
         "pageSize": 100,
     }
-    status, payload, _hdrs = _http_get_json(NAMES_URL, params=params, timeout=HTTP_TIMEOUT)
+    status, payload, _hdrs = _http_get_json(NAMES_URL, params=params, timeout=timeout)
     if status != 200 or not isinstance(payload, dict):
         raise RuntimeError(f"Oväntat svar från names: status={status} payload={payload}")
 
@@ -164,10 +136,10 @@ def find_taxon_id_lepidoptera() -> int:
 
     raise RuntimeError("Kunde inte entydigt hitta Lepidoptera.")
 
-def fetch_children_ids(taxon_id: int, out_path: Path) -> dict:
+def fetch_children_ids(taxon_id: int, *, out_path: Path, timeout: int) -> dict:
     url = CHILDIDS_URL_TEMPLATE.format(taxon_id=taxon_id)
     params = {"useMainChildren": "false"}
-    status, payload, _hdrs = _http_get_json(url, params=params, timeout=60)
+    status, payload, _hdrs = _http_get_json(url, params=params, timeout=timeout)
     if status != 200 or payload is None:
         raise RuntimeError(f"Misslyckades hämta childids: status={status} payload={payload}")
     _dump_json(out_path, payload)
@@ -184,30 +156,30 @@ def _extract_child_ids(child_ids_payload: Any) -> list[int]:
 
 
 # ========= Cache =========
-def _cache_paths(taxon_id: int) -> tuple[Path, Path]:
+def _cache_paths(cache_dir: Path, taxon_id: int) -> tuple[Path, Path]:
     sub = f"{taxon_id // 10000:04d}"
-    data_path = CACHE_DIR / sub / f"{taxon_id}.json"
-    meta_path = CACHE_DIR / sub / f"{taxon_id}.meta.json"
+    data_path = cache_dir / sub / f"{taxon_id}.json"
+    meta_path = cache_dir / sub / f"{taxon_id}.meta.json"
     return data_path, meta_path
 
-def _cache_needs_refresh(meta: dict) -> bool:
+def _cache_needs_refresh(meta: dict, ttl_seconds: int) -> bool:
     fetched_at = int(meta.get("fetched_at", 0))
     if fetched_at <= 0:
         return True
-    if REFRESH_TTL_SECONDS <= 0:
+    if ttl_seconds <= 0:
         return False
-    return (_now() - fetched_at) >= REFRESH_TTL_SECONDS
+    return (_now() - fetched_at) >= ttl_seconds
 
-def get_taxon_cached(taxon_id: int) -> dict | None:
-    data_path, meta_path = _cache_paths(taxon_id)
+def get_taxon_cached(cache_dir: Path, taxon_id: int, ttl_seconds: int) -> dict | None:
+    data_path, meta_path = _cache_paths(cache_dir, taxon_id)
     if data_path.exists() and meta_path.exists():
         meta = _read_json(meta_path)
-        if not _cache_needs_refresh(meta) and int(meta.get("status", 0)) == 200:
+        if not _cache_needs_refresh(meta, ttl_seconds) and int(meta.get("status", 0)) == 200:
             return _read_json(data_path)
     return None
 
-def _write_cache(taxon_id: int, status: int, payload: dict | None) -> None:
-    data_path, meta_path = _cache_paths(taxon_id)
+def _write_cache(cache_dir: Path, taxon_id: int, status: int, payload: dict | None) -> None:
+    data_path, meta_path = _cache_paths(cache_dir, taxon_id)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     meta = {
@@ -225,10 +197,10 @@ def _write_cache(taxon_id: int, status: int, payload: dict | None) -> None:
 
     _dump_json(meta_path, meta)
 
-def _taxon_ids_to_fetch(all_ids: list[int]) -> list[int]:
+def _taxon_ids_to_fetch(cache_dir: Path, all_ids: list[int], ttl_seconds: int) -> list[int]:
     out: list[int] = []
     for tid in all_ids:
-        data_path, meta_path = _cache_paths(tid)
+        data_path, meta_path = _cache_paths(cache_dir, tid)
         if not meta_path.exists() or not data_path.exists():
             out.append(tid)
             continue
@@ -237,28 +209,32 @@ def _taxon_ids_to_fetch(all_ids: list[int]) -> list[int]:
         except Exception:
             out.append(tid)
             continue
-        if _cache_needs_refresh(meta):
+        if _cache_needs_refresh(meta, ttl_seconds):
             out.append(tid)
     return out
 
-def _chunk(seq: list[int], n: int):
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
-
-def refresh_taxa_cache_batch(taxon_ids: list[int], *, culture: str = "sv_SE") -> int:
-    to_fetch = _taxon_ids_to_fetch(taxon_ids)
+def refresh_taxa_cache_batch(
+    cache_dir: Path,
+    taxon_ids: list[int],
+    *,
+    culture: str,
+    ttl_seconds: int,
+    batch_size: int,
+    timeout: int,
+) -> int:
+    to_fetch = _taxon_ids_to_fetch(cache_dir, taxon_ids, ttl_seconds)
     if not to_fetch:
         return 0
 
     written_ok = 0
     params = {"culture": culture}
 
-    for batch in _chunk(to_fetch, POST_BATCH_SIZE):
+    for batch in _chunk(to_fetch, batch_size):
         status, payload, _hdrs = _http_post_json(
             TAXA_POST_URL,
             params=params,
             body={"taxonIds": batch},
-            timeout=max(HTTP_TIMEOUT, 60),
+            timeout=max(timeout, 60),
         )
 
         if status != 200 or not isinstance(payload, list):
@@ -270,12 +246,12 @@ def refresh_taxa_cache_batch(taxon_ids: list[int], *, culture: str = "sv_SE") ->
                 continue
             tid = int(obj["taxonId"])
             returned_ids.add(tid)
-            _write_cache(tid, 200, obj)
+            _write_cache(cache_dir, tid, 200, obj)
             written_ok += 1
 
         for tid in batch:
             if tid not in returned_ids:
-                _write_cache(tid, 404, None)
+                _write_cache(cache_dir, tid, 404, None)
 
     return written_ok
 
@@ -310,39 +286,118 @@ def extract_names(taxon_obj: dict) -> dict:
     }
 
 
+# ========= Source revision file =========
+def load_source_rev(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return _read_json(path)
+    except Exception:
+        return None
+
+def write_source_rev(path: Path, lepidoptera_id: int, child_ids: list[int], source_hash: str) -> None:
+    _dump_json(path, {
+        "lepidopteraTaxonId": int(lepidoptera_id),
+        "childCount": len(child_ids),
+        "sourceHash": source_hash,
+        "updatedAt": _now(),
+    })
+
+
+# ========= CLI =========
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Refresh local Lepidoptera species cache and SQLite database (Dyntaxa).")
+
+    p.add_argument("--force", action="store_true", help="Run even if source revision unchanged (ignore fast-exit).")
+    p.add_argument("--no-sqlite", action="store_true", help="Skip SQLite update step.")
+    p.add_argument("--only-refresh-cache", action="store_true", help="Only refresh cache (POST /taxa batches).")
+    p.add_argument("--only-build-lists", action="store_true", help="Only build lists from cache; do not refresh via POST /taxa.")
+
+    p.add_argument("--culture", default=os.getenv("DYNTAXA_CULTURE", "sv_SE"), help="Culture param (default: sv_SE).")
+    p.add_argument("--ttl-seconds", type=int, default=REFRESH_TTL_SECONDS_DEFAULT, help="Cache TTL seconds (0 = new only).")
+    p.add_argument("--batch-size", type=int, default=POST_BATCH_SIZE_DEFAULT, help="POST /taxa batch size.")
+    p.add_argument("--timeout", type=int, default=HTTP_TIMEOUT_DEFAULT, help="HTTP timeout seconds.")
+
+    p.add_argument("--tmp-dir", type=Path, default=Path(os.getenv("DYNTAXA_TMP_DIR", "./tmp")), help="Tmp root dir.")
+    p.add_argument("--db", type=Path, default=Path(os.getenv("DYNTAXA_DB", "./tmp/dyntaxa_lepidoptera.sqlite")), help="SQLite db path.")
+    p.add_argument("--fast-exit", action="store_true", default=FAST_EXIT_ON_UNCHANGED_SOURCE_DEFAULT, help="Fast exit when source revision unchanged.")
+    p.add_argument("--no-fast-exit", dest="fast_exit", action="store_false", help="Disable fast exit when source revision unchanged.")
+
+    args = p.parse_args()
+
+    if args.only_refresh_cache and args.only_build_lists:
+        p.error("Choose only one of --only-refresh-cache and --only-build-lists.")
+
+    return args
+
+
 # ========= Main pipeline =========
 def main() -> None:
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
 
-    lepidoptera_id = find_taxon_id_lepidoptera()
+    tmp_dir: Path = args.tmp_dir
+    cache_dir = tmp_dir / "taxa_cache"
+
+    children_file = tmp_dir / "children_to_Lepidoptera.json"
+    species_ids_file = tmp_dir / "species_ids_lepidoptera.json"
+    species_table_file = tmp_dir / "species_table_lepidoptera.json"
+    source_rev_file = tmp_dir / "lepidoptera_source_rev.json"
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    lepidoptera_id = find_taxon_id_lepidoptera(culture=args.culture, timeout=args.timeout)
     print(f"Dyntaxa database is online, Lepidoptera found as TaxonId {lepidoptera_id}, continuing ...")
 
-    child_payload = fetch_children_ids(lepidoptera_id, CHILDREN_FILE)
-    print(f"Saved child ids to: {CHILDREN_FILE}")
+    child_payload = fetch_children_ids(lepidoptera_id, out_path=children_file, timeout=max(args.timeout, 60))
+    print(f"Saved child ids to: {children_file}")
 
     child_ids = _extract_child_ids(child_payload)
     print(f"Child ids count: {len(child_ids)}")
 
     source_hash = _stable_ids_hash(lepidoptera_id, child_ids)
-    prev = _load_source_rev()
-    if prev and prev.get("sourceHash") == source_hash and int(prev.get("lepidopteraTaxonId", 0)) == int(lepidoptera_id):
+    prev = load_source_rev(source_rev_file)
+
+    source_unchanged = (
+        prev
+        and prev.get("sourceHash") == source_hash
+        and int(prev.get("lepidopteraTaxonId", 0)) == int(lepidoptera_id)
+    )
+
+    if source_unchanged:
         print("Source revision unchanged (root + childIds).")
-        if FAST_EXIT_ON_UNCHANGED_SOURCE:
-            print("DYNTAXA_FAST_EXIT=1 => skipping refresh + rebuild + sqlite.")
+        if args.fast_exit and not args.force:
+            print("Fast-exit enabled => exiting early. Use --force or --no-fast-exit to override.")
             return
-        else:
-            print("DYNTAXA_FAST_EXIT=0 => continuing anyway (TTL refresh may still happen).")
 
-    before_missing = sum(1 for tid in child_ids if not _cache_paths(tid)[1].exists())
-    written_ok = refresh_taxa_cache_batch(child_ids, culture="sv_SE")
+    # Refresh cache unless explicitly disabled
+    before_missing = sum(1 for tid in child_ids if not _cache_paths(cache_dir, tid)[1].exists())
+    written_ok = 0
 
+    if not args.only_build_lists:
+        written_ok = refresh_taxa_cache_batch(
+            cache_dir,
+            child_ids,
+            culture=args.culture,
+            ttl_seconds=args.ttl_seconds,
+            batch_size=args.batch_size,
+            timeout=args.timeout,
+        )
+
+    if args.only_refresh_cache:
+        write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
+        print(f"Cache miss before run: {before_missing}")
+        print(f"Fetched/updated this run (200 OK): {written_ok}")
+        print(f"Source rev: {source_rev_file}")
+        return
+
+    # Build lists from cache
     species_ids: list[int] = []
     species_table: list[dict] = []
 
     skipped_missing = 0
     for tid in child_ids:
-        obj = get_taxon_cached(tid)
+        obj = get_taxon_cached(cache_dir, tid, args.ttl_seconds)
         if obj is None:
             skipped_missing += 1
             continue
@@ -350,37 +405,44 @@ def main() -> None:
             species_ids.append(tid)
             species_table.append(extract_names(obj))
 
-    _dump_json(SPECIES_IDS_FILE, {"lepidopteraTaxonId": lepidoptera_id, "speciesTaxonIds": species_ids})
-    _dump_json(SPECIES_TABLE_FILE, {"lepidopteraTaxonId": lepidoptera_id, "species": species_table})
+    _dump_json(species_ids_file, {"lepidopteraTaxonId": lepidoptera_id, "speciesTaxonIds": species_ids})
+    _dump_json(species_table_file, {"lepidopteraTaxonId": lepidoptera_id, "species": species_table})
 
     print(f"Species count (Accepted/Taxonomic): {len(species_ids)}")
     print(f"Cache miss before run: {before_missing}")
     print(f"Fetched/updated this run (200 OK): {written_ok}")
     print(f"Skipped non-returned taxa (cached as 404/missing): {skipped_missing}")
-    print(f"Wrote: {SPECIES_IDS_FILE}")
-    print(f"Wrote: {SPECIES_TABLE_FILE}")
+    print(f"Wrote: {species_ids_file}")
+    print(f"Wrote: {species_table_file}")
 
-    # SQLite integration
-    DB_PATH = Path("./tmp/dyntaxa_lepidoptera.sqlite")
-    con = db_open(DB_PATH)
+    # SQLite step
+    if args.no_sqlite:
+        write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
+        print("SQLite: skipped (--no-sqlite)")
+        print(f"Source rev: {source_rev_file}")
+        return
 
+    con = db_open(args.db)
     run_id = begin_run(con, lepidoptera_id, len(child_ids), source_hash=source_hash)
 
     inserted = updated = unchanged = 0
     active_species: set[int] = set()
 
     for tid in child_ids:
-        obj = get_taxon_cached(tid)
+        obj = get_taxon_cached(cache_dir, tid, args.ttl_seconds)
         if obj is None:
             continue
         if not is_species_accepted_taxonomic(obj):
             continue
 
-        _data_path, meta_path = _cache_paths(tid)
+        _data_path, meta_path = _cache_paths(cache_dir, tid)
         sha = None
         if meta_path.exists():
-            meta = _read_json(meta_path)
-            sha = meta.get("sha256")
+            try:
+                meta = _read_json(meta_path)
+                sha = meta.get("sha256")
+            except Exception:
+                sha = None
         if sha is None:
             sha = taxon_sha256(obj)
 
@@ -406,12 +468,12 @@ def main() -> None:
         deactivated=deactivated,
     )
 
-    # Update revision file last (after successful run)
-    _write_source_rev(lepidoptera_id, child_ids, source_hash)
+    write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
 
     print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, unchanged={unchanged}, deactivated={deactivated}")
-    print(f"DB: {DB_PATH}")
-    print(f"Source rev: {SOURCE_REV_FILE}")
+    print(f"DB: {args.db}")
+    print(f"Source rev: {source_rev_file}")
+
 
 if __name__ == "__main__":
     main()
