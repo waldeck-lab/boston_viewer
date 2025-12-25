@@ -12,6 +12,17 @@ import requests
 
 from dyntaxa_sqlite import db_open, begin_run, end_run, upsert_taxon, deactivate_missing_species
 
+
+# Repo root
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+DATA_ROOT_DEFAULT = Path(os.getenv("DYNTAXA_DATA_ROOT", str(REPO_ROOT / "data")))
+CACHE_ROOT_DEFAULT = Path(os.getenv("DYNTAXA_CACHE_ROOT", str(DATA_ROOT_DEFAULT / "cache")))
+DB_ROOT_DEFAULT = Path(os.getenv("DYNTAXA_DB_ROOT", str(DATA_ROOT_DEFAULT / "db")))
+
+DB_PATH_DEFAULT = Path(os.getenv("DYNTAXA_DB", str(DB_ROOT_DEFAULT / "dyntaxa_lepidoptera.sqlite")))
+
+
 # ========= Config (API key stays in env) =========
 SUBSCRIPTION_KEY = os.getenv("ARTDB_KEY")
 if not SUBSCRIPTION_KEY:
@@ -318,8 +329,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=POST_BATCH_SIZE_DEFAULT, help="POST /taxa batch size.")
     p.add_argument("--timeout", type=int, default=HTTP_TIMEOUT_DEFAULT, help="HTTP timeout seconds.")
 
-    p.add_argument("--tmp-dir", type=Path, default=Path(os.getenv("DYNTAXA_TMP_DIR", "./tmp")), help="Tmp root dir.")
-    p.add_argument("--db", type=Path, default=Path(os.getenv("DYNTAXA_DB", "./tmp/dyntaxa_lepidoptera.sqlite")), help="SQLite db path.")
+    p.add_argument("--tmp-dir",type=Path,default=Path(os.getenv("DYNTAXA_TMP_DIR", str(CACHE_ROOT_DEFAULT))),help="Cache root dir (children/species lists + taxa_cache).",)
+
+    p.add_argument("--db",type=Path,default=Path(os.getenv("DYNTAXA_DB", str(DB_ROOT_DEFAULT / "dyntaxa_lepidoptera.sqlite"))),help="SQLite db path.",)
+    
     p.add_argument("--fast-exit", action="store_true", default=FAST_EXIT_ON_UNCHANGED_SOURCE_DEFAULT, help="Fast exit when source revision unchanged.")
     p.add_argument("--no-fast-exit", dest="fast_exit", action="store_false", help="Disable fast exit when source revision unchanged.")
 
