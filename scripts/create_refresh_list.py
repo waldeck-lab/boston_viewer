@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+
+# MIT License
+#
+# Copyright (c) 2025 Jonas Waldeck
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
 import argparse
 import hashlib
 import json
@@ -7,6 +24,10 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Logger
+import logging
+from logging.handlers import RotatingFileHandler
 
 import requests
 
@@ -44,6 +65,47 @@ REFRESH_TTL_SECONDS_DEFAULT = int(os.getenv("DYNTAXA_CACHE_TTL_SECONDS", "0"))
 POST_BATCH_SIZE_DEFAULT = int(os.getenv("DYNTAXA_POST_BATCH_SIZE", "200"))
 FAST_EXIT_ON_UNCHANGED_SOURCE_DEFAULT = os.getenv("DYNTAXA_FAST_EXIT", "1") == "1"
 
+DEFAULT_VERBOSE = os.getenv("DYNTAXA_VERBOSE", "1") == "1"
+
+
+# ========= Logging =========
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = Path(os.getenv("DYNTAXA_LOG_DIR", str(REPO_ROOT / "logs")))
+LOG_FILE = LOG_DIR / "dyntaxa_refresh.log"
+
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("dyntaxa")
+    logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File handler (append, roterande)
+    fh = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+
+    # Console handler (INFO eller DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    # Undvik dubbla handlers vid import/test
+    logger.propagate = False
+
+    return logger
 
 # ========= Helpers =========
 def _now() -> int:
@@ -335,6 +397,18 @@ def parse_args() -> argparse.Namespace:
     
     p.add_argument("--fast-exit", action="store_true", default=FAST_EXIT_ON_UNCHANGED_SOURCE_DEFAULT, help="Fast exit when source revision unchanged.")
     p.add_argument("--no-fast-exit", dest="fast_exit", action="store_false", help="Disable fast exit when source revision unchanged.")
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        default=DEFAULT_VERBOSE,
+        help="Verbose logging (default via DYNTAXA_VERBOSE).",
+    )
+    p.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="Disable verbose logging.",
+    )
 
     args = p.parse_args()
 
@@ -347,6 +421,8 @@ def parse_args() -> argparse.Namespace:
 # ========= Main pipeline =========
 def main() -> None:
     args = parse_args()
+    logger = setup_logging(verbose=args.verbose)
+    logger.info("=== Dyntaxa refresh started ===")
 
     tmp_dir: Path = args.tmp_dir
     cache_dir = tmp_dir / "taxa_cache"
@@ -360,14 +436,21 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     lepidoptera_id = find_taxon_id_lepidoptera(culture=args.culture, timeout=args.timeout)
-    print(f"Dyntaxa database is online, Lepidoptera found as TaxonId {lepidoptera_id}, continuing ...")
-
+    #print(f"Dyntaxa database is online, Lepidoptera found as TaxonId {lepidoptera_id}, continuing ...")
+    logger.info("Dyntaxa database is online")
+    
     child_payload = fetch_children_ids(lepidoptera_id, out_path=children_file, timeout=max(args.timeout, 60))
-    print(f"Saved child ids to: {children_file}")
+    #print(f"Saved child ids to: {children_file}")
 
     child_ids = _extract_child_ids(child_payload)
-    print(f"Child ids count: {len(child_ids)}")
+    #print(f"Child ids count: {len(child_ids)}")
 
+    logger.info(
+        "Lepidoptera taxonId=%d, childIds=%d",
+        lepidoptera_id,
+        len(child_ids),
+    )
+    
     source_hash = _stable_ids_hash(lepidoptera_id, child_ids)
     prev = load_source_rev(source_rev_file)
 
@@ -378,9 +461,12 @@ def main() -> None:
     )
 
     if source_unchanged:
-        print("Source revision unchanged (root + childIds).")
+        #print("Source revision unchanged (root + childIds).")
+        logger.info("Source revision unchanged (root + childIds).")
         if args.fast_exit and not args.force:
-            print("Fast-exit enabled => exiting early. Use --force or --no-fast-exit to override.")
+            #print("Fast-exit enabled => exiting early. Use --force or --no-fast-exit to override.")
+            logger.info("Source unchanged → fast-exit")
+            logger.info("=== Dyntaxa refresh finished ===")
             return
 
     # Refresh cache unless explicitly disabled
@@ -399,9 +485,16 @@ def main() -> None:
 
     if args.only_refresh_cache:
         write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
-        print(f"Cache miss before run: {before_missing}")
-        print(f"Fetched/updated this run (200 OK): {written_ok}")
-        print(f"Source rev: {source_rev_file}")
+        #print(f"Cache miss before run: {before_missing}")
+        #print(f"Fetched/updated this run (200 OK): {written_ok}")
+        #print(f"Source rev: {source_rev_file}")
+        logger.info(
+            "Cache: miss_before=%d fetched_ok=%d source_rev_file =%d",
+            before_missing,
+            written_ok,
+            source_rev_file,
+        )
+        logger.info("=== Dyntaxa refresh finished ===")
         return
 
     # Build lists from cache
@@ -421,18 +514,29 @@ def main() -> None:
     _dump_json(species_ids_file, {"lepidopteraTaxonId": lepidoptera_id, "speciesTaxonIds": species_ids})
     _dump_json(species_table_file, {"lepidopteraTaxonId": lepidoptera_id, "species": species_table})
 
-    print(f"Species count (Accepted/Taxonomic): {len(species_ids)}")
-    print(f"Cache miss before run: {before_missing}")
-    print(f"Fetched/updated this run (200 OK): {written_ok}")
-    print(f"Skipped non-returned taxa (cached as 404/missing): {skipped_missing}")
-    print(f"Wrote: {species_ids_file}")
-    print(f"Wrote: {species_table_file}")
+    #print(f"Species count (Accepted/Taxonomic): {len(species_ids)}")
+    #print(f"Cache miss before run: {before_missing}")
+    #print(f"Fetched/updated this run (200 OK): {written_ok}")
+    #print(f"Skipped non-returned taxa (cached as 404/missing): {skipped_missing}")
+    #print(f"Wrote: {species_ids_file}")
+    #print(f"Wrote: {species_table_file}")
+
+    logger.info(
+        "Species count (Accepted/Taconomic)=%d, Cache: miss_before=%d fetched_ok=%d skipped_missing=%d",
+        len(species_ids),
+        before_missing,
+        written_ok,
+        skipped_missing,
+    )
+    logger.info("Wrote: %s, %s",species_ids_file, species_table_file)
 
     # SQLite step
     if args.no_sqlite:
         write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
-        print("SQLite: skipped (--no-sqlite)")
-        print(f"Source rev: {source_rev_file}")
+        #print("SQLite: skipped (--no-sqlite)")
+        #print(f"Source rev: {source_rev_file}")
+        logger.info("SQLite: skipped (--no-sqlite)")
+        logger.info("=== Dyntaxa refresh finished ===")
         return
 
     con = db_open(args.db)
@@ -483,9 +587,19 @@ def main() -> None:
 
     write_source_rev(source_rev_file, lepidoptera_id, child_ids, source_hash)
 
-    print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, unchanged={unchanged}, deactivated={deactivated}")
-    print(f"DB: {args.db}")
-    print(f"Source rev: {source_rev_file}")
+    #print(f"SQLite: inserted={inserted}, updated/reactivated={updated}, unchanged={unchanged}, deactivated={deactivated}")
+    #print(f"DB: {args.db}")
+    #print(f"Source rev: {source_rev_file}")
+
+    logger.info(
+        "SQLite: inserted=%d updated=%d unchanged=%d deactivated=%d",
+        inserted,
+        updated,
+        unchanged,
+        deactivated,
+    )
+    logger.info("=== Dyntaxa refresh finished ===")
+
 
 
 if __name__ == "__main__":
