@@ -45,9 +45,9 @@ DB_PATH_DEFAULT = Path(os.getenv("DYNTAXA_DB", str(DB_ROOT_DEFAULT / "dyntaxa_le
 
 
 # ========= Config (API key stays in env) =========
-SUBSCRIPTION_KEY = os.getenv("ARTDB_KEY")
+SUBSCRIPTION_KEY = os.getenv("ARTDATABANKEN_SUBSCRIPTION_KEY")
 if not SUBSCRIPTION_KEY:
-    print("Saknar ARTDB_KEY i environment. Kör: export ARTDB_KEY='...'", file=sys.stderr)
+    print("Saknar ARTDB_KEY i environment. Kör: export ARTDATABANKEN_SUBSCRIPTION_KEY='...'", file=sys.stderr)
     sys.exit(1)
 
 HEADERS = {
